@@ -3714,7 +3714,7 @@ impl Threadbear {
                 }),
             ) => {
                 let (secondary, fill) = (p.secondary, p.tile);
-                img(std::path::PathBuf::from(path))
+                img(crate::fit_picture::icon_source(path))
                     .flex_none()
                     .size(px(side))
                     .rounded(radius)
@@ -3829,7 +3829,7 @@ fn render_tile(
             }),
         ) => {
             let (letter, secondary, fill) = (letter.clone(), p.secondary, p.tile);
-            img(std::path::PathBuf::from(path))
+            img(crate::fit_picture::icon_source(path))
                 .size(size)
                 .rounded(px(7.))
                 .object_fit(ObjectFit::Contain)

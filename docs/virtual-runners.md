@@ -276,7 +276,9 @@ The backend's first slice (18 Nov 2026), with tests in
   `convex/runnerAccess.ts` is what it may call, and `ownThreadOnly` holds
   every row check (`mayWrite`, `mayTouch`, `mayClaim`, `mayTake`, the
   moves' `mustBe`, `fileRequest`) to its one thread. Its upload URLs die
-  with its key.
+  with its key. What it holds counts against its runner id's allowances as
+  a runner key's does, a thread moved to it included (`lib.ts
+  hasAllowance`), never as the owner's.
 - **Cloud tokens** (decision 10): `boxes:setCloudToken` (owner, an action)
   seals with AES-GCM under `BOX_SEAL_KEY` (a Convex env var: 32 random
   bytes in base64, `npx convex env set BOX_SEAL_KEY "$(openssl rand
@@ -862,7 +864,8 @@ The fourth slice (19 Nov 2026), the **box image** (`runner/box/Dockerfile`,
 `.github/workflows/box-image.yml` (Faster starts, 1):
 
 - **What's in it.** For linux/amd64, Fly's default: Node 24 on Debian 13
-  (`node:24-trixie-slim`, pinned by digest) with git, procps and ca-certificates; Claude Code's native
+  (`node:24-trixie-slim`, pinned by digest) with git, procps and ca-certificates
+  exactly as `runner/box/debs.lock` names them (below); Claude Code's native
   linux-x64 build at a pinned version, checked against its SHA-256
   (`CLAUDE_CODE_VERSION`, `CLAUDE_CODE_SHA256`), where its installer puts
   it (`~/.local/bin/claude`, a link into `~/.local/share/claude/versions`),
@@ -934,7 +937,31 @@ The fourth slice (19 Nov 2026), the **box image** (`runner/box/Dockerfile`,
 - **Moving Claude Code on** is by hand: both values from its release
   manifest (the Dockerfile says how), in a commit that rebuilds the image.
   Until then a box runs that version, while Mike's other runners follow
-  Claude Code's latest.
+  Claude Code's latest. It's fetched with Node's own fetch: the image
+  build runs no apt and no curl.
+- **Debian's packages from a lock** (Daybreak, 24 Nov: until then the
+  build ran `apt-get update && apt-get install`, so rebuilding a commit took
+  whatever the archive, or anyone who could sign for it, published that
+  day). `runner/box/debs.lock` names every package the box adds (git,
+  procps, ca-certificates and their 37 dependencies) by name, version,
+  architecture, size and SHA-256, from one dated snapshot of Debian's
+  archive, resolved against the pinned base image; `box/debs.ts` fetches
+  each (from snapshot.debian.org, else deb.debian.org) and checks it, and
+  only when all of them match does `dpkg -i` see any, so a different file
+  stops the build before a package script runs; after the install, dpkg must
+  have each at its locked version. A download has a deadline and is read
+  only up to the locked size. The lock stays in the image at
+  `/opt/threadbear/box/debs.lock`, and its hash and snapshot are the
+  image's `dev.threadbear.box.debs-lock` and `-snapshot` labels. Moving it on (a Debian security
+  update, a new base image) is `runner/box/lock-debs.sh [YYYYMMDDTHHMMSSZ]`
+  on a machine with Docker that runs linux/amd64 (the Hetzner box), then
+  reading the diff and committing it, which rebuilds the image. apt reads
+  the snapshot over http inside the base image (which has no CA
+  certificates yet), so the script fetches each index apt used again over
+  https and stops unless they're the same bytes. Until then
+  a box keeps the packages it has, security fixes included: that's the
+  trade for knowing what's in it. A test fails when the Dockerfile's base
+  image changes without a new lock.
 
 The fifth slice (19 Nov 2026), **starting from the Mac and the token
 card** (docs/protocol.md, Virtual runners: "Waiting for a cloud token",

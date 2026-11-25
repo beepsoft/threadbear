@@ -371,6 +371,15 @@ File references are where to look.
   which process it is and whether it's under a thread's CLI (on Linux it
   reads `/proc` instead of running `lsof`), and closes it if it can't tell
   (`runner/src/peer.ts`, docs/protocol/connection.md "Who's really calling").
+  The runner also reads the environments of that process and the ones
+  above it, up to its thread's CLI or, under none, all the way (`/bin/ps
+  eww` and `/bin/ps -ww`, to leave the arguments out, or
+  `/proc/<pid>/environ` on Linux), for another runner's thread, and reads
+  its own parents' the same way once as it starts. It looks only for
+  `THREADBEAR_THREAD_KEY` and `THREADBEAR_THREAD_ID` (and their old
+  `THREADBARE_` names), keeps nothing from a connection's, and keeps the
+  ones its own parents had (a dev runner's starting thread) in memory while
+  it runs, taking them out of its own environment.
   `tb runner` runs `/bin/ps` (or reads `/proc/<pid>/environ` on Linux) on
   its own parents to see whether it's in a thread's shell
   (`runner/src/tb-connect.ts`).
@@ -671,7 +680,9 @@ File references are where to look.
   every 2 minutes and lets go on battery below 15%.
 - **Mike's releases** (`runner/src/upstream.ts`): every 6 hours (15 minutes
   after a look that failed) it lists
-  `upstream`'s `release/*` tags, fetches the newest few into a folder of
+  `upstream`'s `release/*` tags (at its https or ssh address, with git told
+  to run nothing your checkout's own git config names and to read no system
+  or global config), fetches the newest few into a folder of
   their own (`<home>/runner/upstream-fetch`, deleted after each check),
   checks each with `ssh-keygen -Y verify` against the pinned key (the
   signature goes in a temp file under `$TMPDIR` for a moment), fetches

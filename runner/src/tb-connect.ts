@@ -10,15 +10,17 @@ import { psTable } from './proc.ts';
 import { DEFAULT_PORT, paths, readRunnerJson, readToken, runnerUrl, type Config } from './config.ts';
 import os from 'node:os';
 import { dataDirFor } from './platform.ts';
-import { procTable } from './peer.ts';
+import { MARK_NAMES, procTable, psEnvLines, threadMarksIn } from './peer.ts';
 import { ErrorCode } from './protocol.ts';
 import { RunnerClient, type RunnerClientOptions } from './client.ts';
 import { isThreadId, isThreadKey, threadKey } from './rpc-auth.ts';
 
-// Links followed: THREADBEAR_HOME through a link is still this runner.
+// Links followed: THREADBEAR_HOME through a link is still this runner. As
+// the disk spells it, so a Windows path's case or short name doesn't make
+// a thread's own runner look like another (Gemini's review of finding 177).
 const real = (p: string) => {
   try {
-    return fs.realpathSync(p);
+    return fs.realpathSync.native(p);
   } catch {
     return path.resolve(p);
   }
@@ -36,15 +38,65 @@ export function tbCredential(home: string, env: NodeJS.ProcessEnv = process.env)
 
 const options = (c: TbCredential, opts: RunnerClientOptions): RunnerClientOptions => ({ ...opts, ...(c.threadId ? { threadId: c.threadId } : {}) });
 
-export function connectTb(cfg: Config, url: string = runnerUrl(cfg), opts: RunnerClientOptions = {}): Promise<RunnerClient> {
+export async function connectTb(cfg: Config, url: string = runnerUrl(cfg), opts: RunnerClientOptions = {}): Promise<RunnerClient> {
+  const why = await crossHomeRefusal(cfg.home);
+  if (why) throw new Error(why);
   const c = tbCredential(cfg.home);
   return RunnerClient.connect(url, c.token, options(c, opts));
 }
 
-// For a caller that drives `opened` itself, with its own timeout.
+// For a caller that drives `opened` itself, with its own timeout. Only ever
+// a nicety (titles, a log's path), so where connectTb would ask (a thread's
+// tb on Windows pointed at another runner) it doesn't connect.
 export function newTbClient(cfg: Config, url: string = runnerUrl(cfg), opts: RunnerClientOptions = {}): RunnerClient {
+  if (crossHome(cfg.home, process.env, process.platform)) throw new Error("A thread's tb doesn't use another runner's token here.");
   const c = tbCredential(cfg.home);
   return new RunnerClient(url, c.token, options(c, opts));
+}
+
+// A thread's tb (its key in its environment) pointed at another runner's
+// data dir, on Windows (Daybreak finding 177). A Mac's or Linux's runner
+// looks at the environments above a connection and turns away one under
+// another runner's thread itself (peer.ts, ForeignPeer); Windows can't read
+// another process's environment, so there tb asks first.
+// A thread id with no key (a CLI from before thread keys, or a patch's
+// action) can't ask, so it's refused.
+function crossHome(home: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { key?: string; threadId: string; mine: string } | undefined {
+  const key = env.THREADBEAR_THREAD_KEY;
+  const threadId = env.THREADBEAR_THREAD_ID;
+  const mine = env.THREADBEAR_RUNNER_HOME;
+  if (platform !== 'win32' || !isThreadId(threadId) || !mine || sameDir(mine, home)) return undefined;
+  return { ...(isThreadKey(key) ? { key } : {}), threadId, mine };
+}
+
+// Why tb mustn't use another runner's token from here, or undefined. On
+// Windows, a thread's tb pointed at another runner's data dir goes ahead
+// only once its own runner, asked with its key, says it's on Full access (a
+// thread that could read the token and run anything anyway): a limited
+// thread, or no answer, is refused. Its environment can be wiped, so this
+// stops ordinary tb, not a thread set on getting round it: SECURITY.md.
+export async function crossHomeRefusal(home: string, env: NodeJS.ProcessEnv = process.env, deps: { platform?: NodeJS.Platform; connect?: (url: string, token: string, opts: RunnerClientOptions) => Promise<RunnerClient> } = {}): Promise<string | undefined> {
+  const x = crossHome(home, env, deps.platform ?? process.platform);
+  if (!x) return undefined;
+  const cant = "This thread's runner couldn't be asked whether it's on Full access, which tb needs to use another runner's data folder from a thread.";
+  if (!x.key) return cant;
+  let client: RunnerClient;
+  try {
+    const url = `ws://127.0.0.1:${readRunnerJson(x.mine).port || DEFAULT_PORT}/rpc`;
+    client = await (deps.connect ?? ((u, t, o) => RunnerClient.connect(u, t, o)))(url, x.key, { threadId: x.threadId });
+  } catch {
+    return cant;
+  }
+  try {
+    const whoami = await client.call<{ threadId?: string; limited?: boolean; mode?: string }>('auth.whoami');
+    if (whoami.threadId !== x.threadId) return cant;
+    if (whoami.limited) return `This thread is on ${whoami.mode}, so its tb only talks to its own runner, not the one in ${home}.`;
+    return undefined;
+  } catch {
+    return cant;
+  } finally {
+    client.close();
+  }
 }
 
 // Who is running this tb, going by its own environment and its parents'
@@ -69,49 +121,84 @@ export type CallerDeps = {
   ppid?: number;
 };
 
-const KEY_IN_TEXT = /(?:^|[\s\0])THREADBEAR_THREAD_KEY=([0-9a-f]{64})(?=[\s\0]|$)/g;
-const ID_IN_TEXT = /(?:^|[\s\0])THREADBEAR_THREAD_ID=([\w:.-]{1,128})(?=[\s\0]|$)/g;
-
 export async function tbCaller(env: NodeJS.ProcessEnv = process.env, deps: CallerDeps = {}): Promise<TbCaller> {
   const keys: ThreadKeyFound[] = [];
-  if (isThreadKey(env.THREADBEAR_THREAD_KEY)) keys.push({ key: env.THREADBEAR_THREAD_KEY, ids: env.THREADBEAR_THREAD_ID ? [env.THREADBEAR_THREAD_ID] : [] });
+  // Under a CLI from before thread keys (an id with no key variable beside
+  // it; a patch's action has the variable, empty): a thread's, with no key
+  // to say which, so no answer (Daybreak finding 177's reviews).
+  let keyless = false;
+  const take = (text: string) => {
+    const marks = threadMarksIn(text);
+    for (const key of marks.keys) keys.push({ key, ids: marks.ids });
+    if (marks.ids.length && !marks.keys.length && !marks.emptyKey) keyless = true;
+  };
+  // tb's own environment, read as its parents' are.
+  take(['', ...MARK_NAMES.filter((n) => env[n] !== undefined).map((n) => `${n}=${env[n]}`), ''].join('\0'));
   const platform = deps.platform ?? process.platform;
   if (platform === 'win32' && !deps.envOf) return { kind: 'unresolved', why: "Windows can't show another process's environment", keys };
   const envOf = deps.envOf ?? (platform === 'linux' ? linuxEnv : psEnv);
   try {
     const rows: { pid: number; ppid: number; pgid?: number; sid?: number }[] = await (deps.table ?? (platform === 'linux' ? () => procTable() : psTable))();
-    const parents = new Map(rows.map((r) => [r.pid, r.ppid]));
-    const seen = new Set<number>();
-    const look = (p: number) => {
-      if (!parents.has(p)) throw new Error(`process ${p} isn't in the process table`);
-      seen.add(p);
-      const text = envOf(p);
-      const ids = [...text.matchAll(ID_IN_TEXT)].map((m) => m[1]);
-      for (const m of text.matchAll(KEY_IN_TEXT)) keys.push({ key: m[1], ids });
-    };
-    for (let p: number | undefined = deps.ppid ?? process.ppid; p !== undefined && p > 1 && !seen.has(p); p = parents.get(p)) look(p);
-    // A process that left its parents behind (backgrounded, its shell gone)
-    // keeps its process group, and on Linux its session: a thread's tool
-    // command's and its CLI's (Gemini's second review). Their leaders are
-    // looked at too; one that's gone is no answer. Only a process that sets
-    // up a group and session of its own gets past this, as with the runner's
-    // own look (SECURITY.md).
+    const byPid = new Map(rows.map((r) => [r.pid, r]));
     const self = deps.self ?? process.pid;
-    const me = rows.find((r) => r.pid === self);
+    const me = byPid.get(self);
     if (!me) throw new Error(`this process (${self}) isn't in the process table`);
-    for (const leader of [me.pgid, me.sid]) if (leader !== undefined && leader > 1 && leader !== self && !seen.has(leader)) look(leader);
+    const seen = new Set<number>([self]);
+    const look = (p: number) => {
+      if (!byPid.has(p)) throw new Error(`process ${p} isn't in the process table`);
+      seen.add(p);
+      take(envOf(p));
+    };
+    const walk = (from: number | undefined): number[] => {
+      const chain: number[] = [];
+      for (let p = from; p !== undefined && p > 1 && !seen.has(p); p = byPid.get(p)?.ppid) {
+        look(p);
+        chain.push(p);
+      }
+      return chain;
+    };
+    // Its parents, then every leader of a group or (Linux) session that it
+    // or one of them is in, with theirs: a process that left its parents
+    // behind keeps its group, and on Linux its session (Gemini's second
+    // review of finding 174), and on a Mac a tool command's group leader is
+    // its shell, one of Apple's programs, which shows no environment, so the
+    // thread's CLI above it says whose it is (finding 177's reviews). A
+    // session's leader that has gone is no answer; so is a group's, for a
+    // process orphaned in it (its parent launchd or init): one in a terminal
+    // pipeline whose first command has exited still has its parents. Only a
+    // process that sets up a group and session of its own gets past this,
+    // as with the runner's own look (SECURITY.md). A gone session leader
+    // above tb's own (a terminal app started from a shell since closed)
+    // says nothing about tb, so only tb's own counts. The parents are the
+    // table's, the same look as everything else (Gemini's review).
+    const queue = [self, ...walk(deps.ppid ?? me.ppid)];
+    for (let i = 0; i < queue.length; i++) {
+      const row = byPid.get(queue[i]!)!;
+      for (const [leader, kind] of [[row.pgid, 'group'], [row.sid, 'session']] as const) {
+        if (leader === undefined || leader <= 1 || leader === row.pid || seen.has(leader)) continue;
+        if (!byPid.has(leader)) {
+          if ((kind === 'session' && row.pid === self) || (kind === 'group' && row.ppid <= 1)) throw new Error(`process ${row.pid}'s ${kind} leader (${leader}) has gone`);
+          continue;
+        }
+        queue.push(...walk(leader));
+      }
+    }
   } catch (e) {
     return { kind: 'unresolved', why: String((e as Error)?.message ?? e), keys };
   }
+  if (!keys.length && keyless) return { kind: 'unresolved', why: 'a thread from before thread keys is above this', keys };
   return keys.length ? { kind: 'thread', keys } : { kind: 'owner' };
 }
 
-// A Mac's: /bin/ps, never one found on PATH. A process of another user
-// shows no environment, as none of a thread's processes are.
+// A Mac's: /bin/ps, never one found on PATH, with the arguments taken off
+// (`ps -ww` gives those alone), so a key or id in a command's arguments
+// isn't one. A process of another user, or one of Apple's own programs,
+// shows no environment, as none of a thread's CLIs are.
 function psEnv(pid: number): string {
-  const out = execFileSync('/bin/ps', ['eww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
-  if (!out.trim()) throw new Error(`ps showed nothing for process ${pid}`);
-  return out;
+  const run = (args: string[]) => execFileSync('/bin/ps', [...args, '-o', 'pid=,command=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  const env = psEnvLines(run(['eww']), [pid], run(['-ww'])).get(pid);
+  if (env === undefined) throw new Error(`ps showed nothing for process ${pid}`);
+  return env;
 }
 
 // Linux's, exactly as the process got it. One of another user's can't be

@@ -3,6 +3,7 @@
 // a thread's shell runs can read the token file or wipe its own key from the
 // environment. The kernel can say what it's a child of, so the server looks at
 // the far end of the connection and walks up its parents to a thread's CLI.
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -31,7 +32,25 @@ export type PeerDeps = {
   lookupMs?: number;
   // Linux: where /proc is (tests pass a stand-in tree).
   procRoot?: string;
+  // The environments of these processes, as text (keyedThreads). Tests pass
+  // a stand-in; a lookup given a stand-in table or lsof and none of these
+  // reads no environments, as its pids aren't real.
+  envOf?: EnvsOf;
+  // The thread keys and ids this runner was started under (ownThreadMarks):
+  // a thread that started a dev runner is that runner's owner.
+  own?: OwnMarks;
+  // A thread's key as this runner makes it (threadKey with its token): a
+  // key found in an environment is checked against it.
+  keyOf?: (threadId: string) => string;
+  // This runner's pid (tests pass a stand-in): a process under it that it
+  // started for a thread (a patch's action) has the thread's id and the key's
+  // variable, empty.
+  self?: number;
 };
+
+// Every process's environment it could read, by pid; one it couldn't find
+// is left out.
+export type EnvsOf = (pids: number[]) => Promise<Map<number, string>>;
 
 // 3 s until 23 Nov 2026. A lookup that runs out now closes the connection
 // rather than letting its credential decide (Daybreak finding 175), so it
@@ -71,6 +90,53 @@ export class AmbiguousPeer extends Error {}
 // failing, timing out or finding nobody holding a socket the runner has
 // just accepted, or ps failing. The server closes the connection.
 export class UnresolvedPeer extends Error {}
+
+// Thrown when a connection this runner's registry finds under none of its
+// threads comes from under a thread of another runner on this machine (a
+// thread key in its environment or a parent's) that didn't start this
+// runner. This runner can't give it that thread's limits, so it closes it
+// rather than take it as the owner (Daybreak finding 177).
+export class ForeignPeer extends Error {}
+
+// The thread keys and thread ids in a process's environment as text (a
+// Mac's `ps eww` with its arguments taken off, or Linux's
+// /proc/<pid>/environ with its NULs), each once. The runner gives every
+// thread's CLI both (restart.ts, threadEnv; a CLI started before thread
+// keys has only the id, and one from before the rename only THREADBARE_'s),
+// and a CLI's own environment can't be changed by anything it runs.
+const KEY_IN_TEXT = /(?:^|[\s\0])THREADB(?:EAR|ARE)_THREAD_KEY=([0-9a-f]{64})(?=[\s\0]|$)/g;
+const ID_IN_TEXT = /(?:^|[\s\0])THREADB(?:EAR|ARE)_THREAD_ID=([\w:.-]{1,128})(?=[\s\0]|$)/g;
+// emptyKey: the key's variable is there and empty, as the runner gives a
+// patch's action or a worktree's setup (threadEnv with no key); a CLI from
+// before thread keys has no such variable at all.
+export type ThreadMarks = { keys: string[]; ids: string[]; emptyKey: boolean };
+const EMPTY_KEY = /(?:^|[\s\0])THREADB(?:EAR|ARE)_THREAD_KEY=(?=[\s\0]|$)/;
+export type OwnMarks = { keys: ReadonlySet<string>; ids: ReadonlySet<string> };
+export function threadMarksIn(text: string): ThreadMarks {
+  // Linux's (NUL-separated, from procEnvs): each entry by its exact name, so
+  // a value that mentions one isn't one. A Mac's ps line can't be split
+  // like that, so a value that does reads as one too: it can only add.
+  if (text.startsWith('\0')) {
+    const keys = new Set<string>();
+    const ids = new Set<string>();
+    let emptyKey = false;
+    for (const entry of text.split('\0')) {
+      const m = /^THREADB(?:EAR|ARE)_THREAD_(KEY|ID)=(.*)$/s.exec(entry);
+      if (m?.[1] === 'KEY' && m[2] === '') emptyKey = true;
+      else if (m?.[1] === 'KEY' && /^[0-9a-f]{64}$/.test(m[2]!)) keys.add(m[2]!);
+      else if (m?.[1] === 'ID' && /^[\w:.-]{1,128}$/.test(m[2]!)) ids.add(m[2]!);
+    }
+    return { keys: [...keys], ids: [...ids], emptyKey };
+  }
+  return { keys: [...new Set([...text.matchAll(KEY_IN_TEXT)].map((m) => m[1]!))], ids: [...new Set([...text.matchAll(ID_IN_TEXT)].map((m) => m[1]!))], emptyKey: EMPTY_KEY.test(text) };
+}
+
+const sameKey = (a: string, b: string) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+// More than this in one process's environment isn't a CLI's (it has one of
+// each, and the id under both names): it's turned away rather than have
+// every one checked.
+const MAX_KEYS = 4;
+const MAX_IDS = 8;
 
 // What lsof calls an address in a name: IPv6 in brackets, an IPv4-mapped
 // one as plain IPv4 (Node's dual-stack form).
@@ -388,17 +454,281 @@ export async function threadOfSocket(sock: PeerSocket, deps: PeerDeps): Promise<
     throw new UnresolvedPeer(`could not tell which process connected: ${String(e)}`);
   }
   const threads = new Set<string>();
+  const placed: { thread?: string; below: number[] }[] = [];
   for (const peer of pids) {
-    const t = await threadOfPid(peer, table, deps, windows);
-    if (t) threads.add(t);
+    const found = await threadOfPid(peer, table, deps, windows);
+    if (found.thread) threads.add(found.thread);
+    placed.push({ ...found, below: found.below ?? lookedAt(peer, table, platform) });
   }
   if (threads.size > 1) throw new AmbiguousPeer(`one connection is held by processes under ${threads.size} threads`);
+  // The environments say the rest (Daybreak finding 177). Under none of this
+  // runner's threads isn't yet under none at all: it may be another runner's
+  // thread, or one of this runner's that left its CLI's tree with its key on
+  // it. And under one of its threads' CLIs may still be under another
+  // runner's thread's CLI nearer: a thread of a dev runner that thread
+  // started, which mustn't get the starting thread's access here.
+  const envOf = deps.envOf ?? (deps.lsof || deps.table || deps.snapshot ? undefined : realEnvsOf(platform, deps.procRoot, ms));
+  if (envOf) {
+    const keyed = await keyedThreads(placed, envOf, deps, ms).catch((e: unknown) => {
+      if (e instanceof UnresolvedPeer) deps.log.warn('could not tell which process connected to the RPC', { error: e.message });
+      throw e;
+    });
+    if (keyed === 'foreign') {
+      deps.log.warn("an RPC client is under another runner's thread; closing it", { pids });
+      throw new ForeignPeer("this connection comes from under a thread of another runner on this machine, which didn't start this one");
+    }
+    for (const t of keyed) threads.add(t);
+    if (threads.size > 1) throw new AmbiguousPeer(`one connection is held by processes under ${threads.size} threads`);
+  }
   return threads.size === 1 ? threadPeer([...threads][0]) : OWNER_PEER;
 }
 
-async function threadOfPid(peer: number, table: ProcRow[], deps: PeerDeps, windows: boolean): Promise<string | undefined> {
+// The environment reader for this system: a Mac's /bin/ps, Linux's /proc.
+// Windows has none (its processes' environments can't be read from
+// outside), so there the check isn't made: SECURITY.md says so.
+function realEnvsOf(platform: NodeJS.Platform, procRoot: string | undefined, ms: number): EnvsOf | undefined {
+  if (platform === 'win32') return undefined;
+  if (platform === 'linux') return (pids) => procEnvs(pids, procRoot);
+  return (pids) => psEnvs(pids, ms);
+}
+
+// A Mac's: /bin/ps for them all, never one on PATH, once with their
+// environments (eww) and once without, so what's read is the environment
+// alone: a key or id in a process's arguments (a prompt) isn't one. ps
+// writes a line break inside a value as \012, so each process is a line of
+// its own, its pid first. One of another user's, or one of Apple's own
+// programs (a shell), shows no environment, and has no thread key: a
+// thread's CLI is neither. ps exits 1 only when none of them is there.
+export async function psEnvs(pids: number[], ms = LOOKUP_MS): Promise<Map<number, string>> {
+  const run = (args: string[]) =>
+    new Promise<string>((resolve, reject) => {
+      execFile('/bin/ps', [...args, '-o', 'pid=,command=', '-p', pids.join(',')], { encoding: 'utf8', timeout: ms, maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+        if (err && (err as { code?: unknown }).code !== 1) reject(err);
+        else resolve(stdout);
+      });
+    });
+  const [args, both] = await Promise.all([run(['-ww']), run(['eww'])]);
+  return psEnvLines(both, pids, args);
+}
+
+// From `ps eww`'s lines, each process's environment: what follows its
+// arguments as `ps -ww` gave them. One whose arguments don't start its line
+// (changed between the two) is read whole, which can only add marks.
+export function psEnvLines(out: string, pids: number[], argsOut?: string): Map<number, string> {
+  const lines = (text: string) => {
+    const want = new Set(pids);
+    const byPid = new Map<number, string>();
+    for (const line of text.split('\n')) {
+      const m = /^\s*(\d+) (.*)$/.exec(line);
+      if (!m || !want.has(Number(m[1]))) continue;
+      // One pid twice is a listing that can't be read as one line each.
+      if (byPid.has(Number(m[1]))) throw new Error(`ps listed process ${m[1]} twice`);
+      byPid.set(Number(m[1]), m[2]!);
+    }
+    return byPid;
+  };
+  const both = lines(out);
+  const args = argsOut === undefined ? new Map<number, string>() : lines(argsOut);
+  const envs = new Map<number, string>();
+  for (const [pid, text] of both) {
+    const a = args.get(pid);
+    // The arguments, then a space or the end: one that grew between the two
+    // looks into what follows isn't cut there.
+    envs.set(pid, ' ' + (a !== undefined && text.startsWith(a) && (text.length === a.length || text[a.length] === ' ') ? text.slice(a.length) : text));
+  }
+  return envs;
+}
+
+// Linux's, exactly as each process got it. One the kernel won't show
+// (another user's, or one that made itself undumpable, as ssh's session
+// process does) reads as empty: no thread's CLI is either, and what a
+// thread's own process hides is only its own environment. One that's gone
+// is left out.
+export async function procEnvs(pids: number[], root = '/proc'): Promise<Map<number, string>> {
+  const envs = new Map<number, string>();
+  for (const pid of pids) {
+    try {
+      envs.set(pid, '\0' + (await fs.promises.readFile(`${root}/${pid}/environ`, 'latin1')) + '\0');
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'EACCES' || code === 'EPERM') envs.set(pid, '');
+    }
+  }
+  return envs;
+}
+
+// At most this many processes are looked at for one holder: a parent chain
+// is a handful.
+const MAX_LOOKED_AT = 256;
+
+// The processes whose environments say whose a holder is: its parents up to
+// launchd or init, and, for each of those, its process group's leader and
+// (Linux) its session's leader with theirs, which a process that has left
+// its parents behind keeps (as tb-connect's tbCaller looks). A parent the
+// table hasn't got is no answer (Windows aside, which keeps dead parents'
+// ids). A leader that has gone is passed over: on Linux threadOfPid has
+// already refused a holder whose session's leader has gone; on a Mac
+// nothing is left to say whose group it was (SECURITY.md).
+export function lookedAt(start: number, table: ProcRow[], platform: NodeJS.Platform): number[] {
   const rows = new Map(table.map((r) => [r.pid, r]));
   const seen = new Set<number>();
+  const windows = platform === 'win32';
+  const walk = (from: number): number[] => {
+    const chain: number[] = [];
+    for (let p: number | undefined = from; p !== undefined && p > 1 && !seen.has(p); p = parentOf(rows, p)) {
+      if (!rows.has(p)) {
+        if (windows) break;
+        throw new UnresolvedPeer(`process ${p}, a parent of ${from}, isn't in the process table`);
+      }
+      if (seen.size >= MAX_LOOKED_AT) throw new UnresolvedPeer(`more than ${MAX_LOOKED_AT} processes above ${start}`);
+      seen.add(p);
+      chain.push(p);
+    }
+    return chain;
+  };
+  const queue = walk(start);
+  for (let i = 0; i < queue.length; i++) {
+    const row = rows.get(queue[i]!)!;
+    for (const leader of [row.pgid, platform === 'linux' ? row.sid : undefined]) {
+      if (leader !== undefined && leader > 1 && !seen.has(leader) && rows.has(leader)) queue.push(...walk(leader));
+    }
+  }
+  return [...seen];
+}
+
+// What the thread keys and ids in the environments above these holders
+// say. A holder found under one of this runner's threads (T) is looked at
+// below that thread's CLI: every key there must be T's and every id T's (or
+// ones this runner was started under), so a thread of another runner nearer
+// than T's CLI (a dev runner's, which T started) is turned away. A holder
+// under none is looked at all the way up (lookedAt): a key this runner made
+// for one of its threads makes it that thread (a process that left its
+// CLI's tree with its key on it, like tb land's worker on a Mac); a key this
+// runner was started under is the owner's; any other key is 'foreign'. In
+// an environment with no key (a CLI from before thread keys) an id is
+// foreign too, unless this runner was started under it, or the key's
+// variable is there but empty and the runner is itself above the holder or
+// has that thread (a
+// patch's action or a worktree's setup a runner started, which may have
+// left its tree, as the Land chip's tb land worker does or one under a
+// draining runner; such an action is the user's, trusted to read the token
+// anyway). A CLI from before thread keys has no key variable at all, so
+// having its thread (a draining older runner's, a --clone-real copy's) is
+// no pass for it (Gemini's third review). So is an environment with more keys or ids than any CLI's. Throws
+// UnresolvedPeer when it can't say: a process it has to look at has gone,
+// or the look fails or runs out of time.
+async function keyedThreads(placed: { thread?: string; below: number[] }[], envOf: EnvsOf, deps: PeerDeps, ms: number): Promise<'foreign' | Set<string>> {
+  const pids = new Set<number>();
+  for (const h of placed) for (const p of h.below) pids.add(p);
+  const threads = new Set<string>();
+  if (pids.size === 0) return threads;
+  let envs: Map<number, string>;
+  try {
+    envs = await deadline(envOf([...pids]), ms);
+  } catch (e) {
+    throw new UnresolvedPeer(`could not read the environments of the processes above it: ${String(e)}`);
+  }
+  const own = deps.own ?? { keys: new Set<string>(), ids: new Set<string>() };
+  const keyOf = deps.keyOf;
+  const self = deps.self ?? process.pid;
+  for (const h of placed) {
+    const underSelf = h.below.includes(self);
+    for (const p of h.below) {
+      const text = envs.get(p);
+      if (text === undefined) throw new UnresolvedPeer(`process ${p} went before its environment could be read`);
+      const { keys, ids, emptyKey } = threadMarksIn(text);
+      if (keys.length > MAX_KEYS || ids.length > MAX_IDS) return 'foreign';
+      if (h.thread !== undefined) {
+        const t = h.thread;
+        if (keys.some((k) => !own.keys.has(k) && !(keyOf && sameKey(keyOf(t), k)))) return 'foreign';
+        if (ids.some((id) => id !== t && !own.ids.has(id))) return 'foreign';
+        continue;
+      }
+      const mine = new Set<string>();
+      for (const key of keys) {
+        const t = keyOf ? ids.find((id) => deps.known(id) && sameKey(keyOf(id), key)) : undefined;
+        if (t !== undefined) mine.add(t);
+        else if (!own.keys.has(key)) return 'foreign';
+      }
+      for (const t of mine) threads.add(t);
+      // Beside a key, every id must be the key's thread's or one this runner
+      // was started under: a key it was started under, inherited by another
+      // runner's CLI that kept it (an older runner) beside its own thread's
+      // id, is no pass (Codex's second review).
+      if (keys.length) {
+        if (ids.some((id) => !mine.has(id) && !own.ids.has(id))) return 'foreign';
+      } else if (ids.some((id) => !own.ids.has(id) && !(emptyKey && (underSelf || deps.known(id))))) return 'foreign';
+    }
+  }
+  return threads;
+}
+
+// The thread keys and ids this runner was started under: its own
+// environment's and those of its parents (and their groups' and sessions'
+// leaders). A dev runner started from a thread's shell has that thread's
+// (dev-runner.sh passes its key on), and that thread is its owner: anything
+// under it may use this runner as the owner, as the thread could have
+// started it. A runner started by launchd, systemd or a terminal has none.
+// Read once, as it starts, while its parents are still there to read; a
+// look that fails leaves only its own environment's.
+export async function ownThreadMarks(deps: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; table?: () => Promise<ProcRow[]>; envOf?: EnvsOf; self?: number; log?: Logger } = {}): Promise<OwnMarks> {
+  const env = deps.env ?? process.env;
+  const keys = new Set<string>();
+  const ids = new Set<string>();
+  const add = (text: string) => {
+    const m = threadMarksIn(text);
+    for (const k of m.keys) keys.add(k);
+    for (const i of m.ids) ids.add(i);
+  };
+  add(['', ...MARK_NAMES.map((n) => `${n}=${env[n] ?? ''}`), ''].join('\0'));
+  const platform = deps.platform ?? process.platform;
+  const envOf = deps.envOf ?? realEnvsOf(platform, undefined, LOOKUP_MS);
+  if (!envOf) return { keys, ids };
+  try {
+    const table = await deadline((deps.table ?? (platform === 'linux' ? () => procTable() : psTable))(), LOOKUP_MS);
+    const pids = lookedAtLoosely(deps.self ?? process.pid, table);
+    const envs = await deadline(envOf(pids), LOOKUP_MS);
+    for (const text of envs.values()) add(text);
+  } catch (e) {
+    deps.log?.warn("could not read the thread keys of the runner's own parents", { error: String(e) });
+  }
+  return { keys, ids };
+}
+
+// The variables that mark a thread's process. The runner takes them out of
+// its own environment once it has read them (main.ts), so what it starts
+// without a thread's own (a schedule's check) isn't taken for the thread a
+// dev runner was started under.
+export const MARK_NAMES = ['THREADBEAR_THREAD_KEY', 'THREADBARE_THREAD_KEY', 'THREADBEAR_THREAD_ID', 'THREADBARE_THREAD_ID'] as const;
+
+// The same processes lookedAt takes, without its refusals: for the runner's
+// own parents, where a gap means fewer keys, never more.
+function lookedAtLoosely(start: number, table: ProcRow[]): number[] {
+  const rows = new Map(table.map((r) => [r.pid, r]));
+  const seen = new Set<number>();
+  const walk = (from: number) => {
+    const chain: number[] = [];
+    for (let p: number | undefined = from; p !== undefined && p > 1 && rows.has(p) && !seen.has(p) && seen.size < MAX_LOOKED_AT; p = parentOf(rows, p)) {
+      seen.add(p);
+      chain.push(p);
+    }
+    return chain;
+  };
+  const queue = walk(start);
+  for (let i = 0; i < queue.length; i++) {
+    const row = rows.get(queue[i]!)!;
+    for (const leader of [row.pgid, row.sid]) if (leader !== undefined && leader > 1 && !seen.has(leader) && rows.has(leader)) queue.push(...walk(leader));
+  }
+  return [...seen];
+}
+
+// The thread a holder is under, and when found by its parents, the
+// processes below that thread's CLI (keyedThreads looks at those); found by
+// its group or session, or not at all, keyedThreads looks all the way up.
+async function threadOfPid(peer: number, table: ProcRow[], deps: PeerDeps, windows: boolean): Promise<{ thread?: string; below?: number[] }> {
+  const rows = new Map(table.map((r) => [r.pid, r]));
+  const seen = new Set<number>();
+  const below: number[] = [];
   for (let p: number | undefined = peer; p !== undefined && p > 1 && !seen.has(p); p = parentOf(rows, p)) {
     // A parent the table doesn't have: the walk can't go on, so it can't
     // say this isn't under a thread (Gemini's review of finding 175). On a
@@ -407,14 +737,19 @@ async function threadOfPid(peer: number, table: ProcRow[], deps: PeerDeps, windo
     if (!rows.has(p) && !windows) throw new UnresolvedPeer(`process ${p}, a parent of ${peer}, isn't in the process table`);
     seen.add(p);
     const t = await deps.registry.threadOfPid(p, rows.get(p)?.created);
-    if (t && deps.known(t)) return t;
+    if (t && deps.known(t)) return { thread: t, below };
+    below.push(p);
   }
   // Left its parents behind (a nohup or a backgrounded subshell), but still
-  // in a process group a thread's tool command ran in.
+  // in a process group a thread's tool command ran in: it, or a parent of
+  // it (an orphaned helper still in that group that started it in a group
+  // of its own, Gemini's review of finding 177).
   const row = table.find((r) => r.pid === peer);
-  const group = row?.pgid;
-  const byGroup = group ? deps.registry.threadOfGroup?.(group) : undefined;
-  if (byGroup && deps.known(byGroup)) return byGroup;
+  for (const p of below) {
+    const group = rows.get(p)?.pgid;
+    const byGroup = group ? deps.registry.threadOfGroup?.(group) : undefined;
+    if (byGroup && deps.known(byGroup)) return { thread: byGroup };
+  }
   // Linux: still in the session its CLI leads (the runner starts every CLI
   // in its own), even in a group of its own the registry hasn't seen yet
   // (Codex's third review of finding 175).
@@ -423,9 +758,9 @@ async function threadOfPid(peer: number, table: ProcRow[], deps: PeerDeps, windo
     // killed after its child left the tree: no answer (Codex's fourth review).
     if (!rows.has(row.sid)) throw new UnresolvedPeer(`process ${peer}'s session leader (${row.sid}) has gone`);
     const bySession = await deps.registry.threadOfPid(row.sid, rows.get(row.sid)?.created);
-    if (bySession && deps.known(bySession)) return bySession;
+    if (bySession && deps.known(bySession)) return { thread: bySession };
   }
-  return undefined;
+  return {};
 }
 
 // The parent a process really has: none when the recorded parent started

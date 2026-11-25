@@ -157,8 +157,28 @@ the inventory's). A manifest's icon counts only if it's named like a
 picture and is a file of the repo's own, not a link out of it. The best is
 copied in, so the app never reads a repo, and only if its bytes say it's a
 picture; on Linux ImageMagick gets it with its decoder named (never one it
-picks, as its MSL and MVG ones are scripts), and an SVG is drawn only by
-rsvg-convert. It
+picks, as its MSL and MVG ones are scripts). A picture is a candidate, and is copied, only when its own
+structure, read here without decoding it, says how big every picture in it
+is and that's within the icon budget (`runner/src/icon-budget.ts`: 4096 px
+a side, 4096 x 4096 px and 64 MB decoded in all, at most 32 pictures in an
+`.ico` or `.icns`), so a small file that says it's 60,000 px square is
+never decoded (Daybreak, 24 Nov). Only PNG (whole and well formed, not
+animated, its compressed text and colour profile within 1 MB inflated), ICO
+(PNG or uncompressed bitmaps) and ICNS (PNG and the old fixed-size
+elements; no JPEG 2000 or nested sets) are icons. JPEG and WebP aren't, as
+what a decoder makes of them can't be told from their headers for sure, and
+nor is SVG: it's a program for its renderer more than a size, and three
+review rounds each found a way past a check of its text (a picture inside
+it, CDATA, namespace prefixes, CSS sizing, a mask fan-out), so it waits for
+a real parser. What's copied is the one read and checked, made into a PNG
+of at most 256 px (ImageMagick also told the budget), never the file as it
+was: when the best picture can't be made into one here (an `.icns` on Linux) the next best is tried,
+and with none the project gets a symbol. A copy an older runner kept that
+isn't such a PNG (the repo's file as it was, or an SVG) is dropped as the
+runner starts, before any app is sent its path, and the project goes back
+to automatic (even one Mike chose); the phone is sent no picture outside
+the budget. The desktop app decodes an icon (only a PNG) within the
+same budget. It
 looks again a few seconds after a project is made or its folders change,
 and every hour at all of them, copying again when the file has changed or
 a better one has turned up. A project with no picture gets an SF Symbol:

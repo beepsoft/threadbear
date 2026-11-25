@@ -248,7 +248,10 @@ rest, and `tb <command> --help` explains one.
   the runner applies to a `threads.create` with no model), from `tb` or a
   debug app's composer alike. Run it in the background and use the
   `<dev home>/tb` it prints: a bare `tb` reaches the live runner unless
-  `THREADBEAR_HOME` is set in that same command.
+  `THREADBEAR_HOME` is set in that same command. Only the thread that
+  started it (and what that thread runs), a terminal and the app can use it:
+  another thread's tb is turned away with 4403 (Daybreak finding 177,
+  docs/protocol/connection.md "Who's really calling"), so start your own.
 - Leave `--home` out, or keep it and any extra work folders under `$TMPDIR`:
   Agent Archive skips transcripts from there, but not from `/tmp`, so a
   try-out thread in `/tmp` ends up in Mike's archive.

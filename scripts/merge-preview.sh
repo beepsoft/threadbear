@@ -29,10 +29,29 @@ fi
 commit=${1:?usage: scripts/merge-preview.sh [--prepare <dir>] <commit> [base]}
 base=${2:-refs/heads/main}
 top=$(git rev-parse --show-toplevel)
-objects=$(cd "$top" && git rev-parse --path-format=absolute --git-path objects)
-format=$(git -C "$top" rev-parse --show-object-format 2>/dev/null || echo sha1)
-base_id=$(git -C "$top" rev-parse --verify "$base^{commit}")
-commit_id=$(git -C "$top" rev-parse --verify "$commit^{commit}")
+# Replacement objects and grafts off, and a checkout with either refused:
+# git reads a refs/replace/ entry or info/grafts in place of the object an
+# id names, so the release's signed commit could merge as another, unsigned
+# one (Daybreak 180, 24 Nov 2026).
+# No fetching either: a partial clone missing the release's commit would
+# fetch it through this checkout's own ssh command before anything's shown.
+# GIT_NO_LAZY_FETCH needs git 2.44, so every transport is refused by name
+# too (a protocol's own setting in the repo's config beats protocol.allow).
+export GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1
+unset GIT_GRAFT_FILE GIT_REPLACE_REF_BASE
+here() {
+  git -C "$top" -c protocol.allow=never -c protocol.ext.allow=never -c protocol.fd.allow=never -c protocol.file.allow=never \
+    -c protocol.git.allow=never -c protocol.http.allow=never -c protocol.https.allow=never -c protocol.ssh.allow=never "$@"
+}
+common=$(here rev-parse --path-format=absolute --git-common-dir)
+if [ -n "$(here for-each-ref --count=1 --format='%(refname)' refs/replace/)" ] || [ -e "$common/info/grafts" ]; then
+  echo "This checkout has git replacement refs (refs/replace/) or grafts ($common/info/grafts), which could have git read other objects in place of the release's: remove them (git replace -d, or that file) first." >&2
+  exit 1
+fi
+objects=$(here rev-parse --path-format=absolute --git-path objects)
+format=$(here rev-parse --show-object-format 2>/dev/null || echo sha1)
+base_id=$(here rev-parse --verify "$base^{commit}")
+commit_id=$(here rev-parse --verify "$commit^{commit}")
 if [ -n "$prepare" ]; then
   real_top=$(cd "$top" && pwd -P)
   inside() {
@@ -59,7 +78,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/tb-merge-preview.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 # Nothing of anyone's config: not this repo's, the user's or the system's.
 bare() {
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_TEMPLATE_DIR \
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_TEMPLATE_DIR -u GIT_GRAFT_FILE \
     HOME="$tmp" XDG_CONFIG_HOME="$tmp" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
     git "$@"
 }
@@ -68,7 +87,7 @@ bare() {
 bare init -q --bare --template= "--object-format=$format" "$tmp/r"
 printf '%s\n' "$objects" > "$tmp/r/objects/info/alternates"
 clean() {
-  bare -C "$tmp/r" -c core.attributesFile=/dev/null -c merge.default=text "$@"
+  bare -C "$tmp/r" -c core.attributesFile=/dev/null -c merge.default=text -c core.commitGraph=false "$@"
 }
 empty=$(clean hash-object -t tree /dev/null)
 status=0
@@ -77,6 +96,9 @@ cat "$tmp/out"
 tree=$(head -n 1 "$tmp/out")
 echo
 if [ "$status" -eq 1 ]; then echo "It clashes in the files above."; elif [ "$status" -ne 0 ]; then echo "git merge-tree failed ($status)."; exit "$status"; else echo "It merges cleanly."; fi
+# A clean merge leaves an empty list, so merge-prepared.sh merges it too:
+# one merge helper for every release, with replacements off.
+if [ -n "$prepare" ] && [ "$status" -eq 0 ]; then : > "$prepare/clashes"; fi
 if [ -n "$prepare" ] && [ "$status" -eq 1 ]; then
   mkdir "$prepare/files"
   # The clashing paths: the lines after the tree id, up to the blank line.
@@ -153,7 +175,7 @@ while IFS="$(printf '\t')" read -r _ f subject; do
   echo "The release has a format commit main doesn't: $f ($subject)."
 done < "$tmp/sorted"
 oldest=$(head -n 1 "$tmp/sorted" | cut -f 2)
-if [ -n "$prepare" ] && [ -d "$prepare/files" ]; then
+if [ -n "$prepare" ] && [ -f "$prepare/clashes" ]; then
   rm -rf "$prepare/files" "$prepare/clashes"
   echo "(--prepare: nothing kept, as a release with a format commit merges with replay-over-format.sh: settle its clashes after go.)"
 fi

@@ -1918,7 +1918,7 @@ impl AskHost for Composer {
                     .bg(style::chip_fill(cx))
                     .when_some(path, |d, path| {
                         d.child(
-                            img(path)
+                            img(crate::rows::markdown::file_picture(&path.to_string_lossy()))
                                 .size(px(44.))
                                 .object_fit(ObjectFit::Cover)
                                 .when(!in_yet, |i| i.opacity(0.5)),

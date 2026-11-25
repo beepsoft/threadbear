@@ -200,11 +200,10 @@ pub(crate) enum FileBody {
         text: Arc<str>,
         language: Option<&'static str>,
     },
-    /// `image` is the file as it is (Copy Image copies it); `drawn` the same
-    /// one, or shrunk when it's bigger than the GPU draws (fit_picture.rs).
+    /// `image` is the file's own bytes (Copy Image copies them), drawn
+    /// through the picture budget (fit_picture.rs).
     Picture {
         image: Arc<Image>,
-        drawn: Arc<Image>,
         size: Option<(u32, u32)>,
     },
     /// Something only its own app can show.
@@ -756,29 +755,11 @@ impl SidePane {
         }
         cx.spawn(async move |this, cx| {
             let res = call(client, "files.read", params).await;
-            let read = res.as_ref().ok().map(FileRead::decode);
-            // A picture too big for the GPU, shrunk off this thread to draw
-            // (Some(None): too big to shrink).
-            let big = match (&read, image_format(&path)) {
-                (Some(Some(read)), Some(format))
-                    if crate::fit_picture::size_of(&read.data)
-                        .is_some_and(crate::fit_picture::too_big) =>
-                {
-                    Some((format, read.data.clone()))
-                }
-                _ => None,
-            };
-            let fitted = match big {
-                Some((format, data)) => Some(
-                    cx.background_executor()
-                        .spawn(async move {
-                            crate::fit_picture::fit_bytes(format, data)
-                                .map(|(format, data)| Arc::new(Image::from_bytes(format, data)))
-                        })
-                        .await,
-                ),
-                None => None,
-            };
+            // Not past what was asked for, however much the runner sent.
+            let read = res
+                .as_ref()
+                .ok()
+                .map(|value| FileRead::decode_at_most(value, MAX_BYTES));
             this.update(cx, |this, cx| {
                 // A newer file opened while this one was on its way, or the
                 // same one read again since.
@@ -793,9 +774,7 @@ impl SidePane {
                 }
                 match (res, read) {
                     (Ok(_), Some(read)) => match read {
-                        Some(read) => {
-                            this.show_read(&thread_id, &path, opened, read, here, fitted, cx)
-                        }
+                        Some(read) => this.show_read(&thread_id, &path, opened, read, here, cx),
                         None => this.fail_file(
                             &thread_id,
                             &path,
@@ -899,10 +878,6 @@ impl SidePane {
         cx.notify();
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "baselined when the lint was turned on (20 Nov 2026); take it off when this is next split up"
-    )]
     fn show_read(
         &mut self,
         thread_id: &str,
@@ -910,26 +885,27 @@ impl SidePane {
         opened: u64,
         read: FileRead,
         here: bool,
-        fitted: Option<Option<Arc<Image>>>,
         cx: &mut Context<Self>,
     ) {
         let viewer = core::viewer_for_path(path);
         let is_picture = viewer == Viewer::Picture
             && (core::looks_like_picture(path) || image_format(path).is_some());
         let body = if is_picture {
-            match image_format(path) {
-                // Drawn as it is, one too big to shrink would be a blank box.
-                Some(_) if matches!(fitted, Some(None)) => FileBody::Opaque {
-                    note: crate::fit_picture::TOO_BIG.into(),
-                },
+            // Only its start, or more than was asked for, won't draw.
+            let whole = !read.truncated && read.data.len() as u64 <= MAX_BYTES;
+            match image_format(path).filter(|_| whole) {
                 Some(format) => {
+                    // encoded: the file's own bytes; drawn through the picture budget.
                     let image = Arc::new(Image::from_bytes(format, read.data));
                     FileBody::Picture {
-                        size: picture_size(image.bytes()),
-                        drawn: fitted.flatten().unwrap_or_else(|| image.clone()),
+                        size: crate::fit_picture::size_of(image.bytes())
+                            .or_else(|| picture_size(image.bytes())),
                         image,
                     }
                 }
+                None if !whole => FileBody::Opaque {
+                    note: "This picture is too big to show here.".into(),
+                },
                 None => FileBody::Opaque {
                     note: "This kind of picture opens in its own app.".into(),
                 },
@@ -1663,8 +1639,8 @@ impl SidePane {
                     Err(why) => pane_note(&why, p).into_any_element(),
                 }
             }
-            FileBody::Picture { drawn, .. } => {
-                let source = ImageSource::Image(drawn.clone());
+            FileBody::Picture { image, .. } => {
+                let source = crate::fit_picture::file_bytes_source(image.clone());
                 let (path2, entity) = (path.to_owned(), cx.entity().downgrade());
                 // Dragged, it's the file itself, from this Mac's own threads
                 // only (file_drag.rs, `FilePreviewView`'s drag).
@@ -1692,7 +1668,11 @@ impl SidePane {
                         img(source)
                             .id(SharedString::from(format!("hl-picture-{path}")))
                             .size_full()
-                            .object_fit(ObjectFit::Contain),
+                            .object_fit(ObjectFit::Contain)
+                            // Over the picture budget, or refused as it's decoded.
+                            .with_fallback(move || {
+                                pane_note("Couldn't show this picture.", p).into_any_element()
+                            }),
                     )
                     // Found by scripts, for a drag from it.
                     .test_support()

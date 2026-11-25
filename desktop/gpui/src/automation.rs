@@ -1749,7 +1749,13 @@ fn shell_step(
         }
         // The Canvas page (thread_canvas.rs): show it, fly in and out, and
         // read the board.
-        "canvas" => app.update(cx, |t, cx| t.canvas_command(cmd, window, cx)),
+        // Drawn first, as `click` is: the board is laid out as it's drawn,
+        // and a window the Mac isn't drawing (CI's, behind another) said
+        // only "showing" for good (24 Nov 2026).
+        "canvas" => {
+            window.render_frame(cx);
+            app.update(cx, |t, cx| t.canvas_command(cmd, window, cx))
+        }
         "mode" => {
             let mode = match cmd["mode"].as_str().unwrap_or("inbox") {
                 "scheduled" => shell::SidebarMode::Scheduled,

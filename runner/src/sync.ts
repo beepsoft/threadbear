@@ -77,6 +77,16 @@ export const SYNC_BATCH = 50;
 // push(...items) and unshift(...items) pass each item as an argument, and a
 // whole history's worth (hundreds of thousands) overflows the stack
 // (THREADBEAR-28, putting a failed flush's messages back). These don't.
+// Where a start sends a thread's messages from: after the mirror's newest,
+// unless that's past the thread's own last seq. No row this runner sent can
+// be, so one there was written by something else (an old copy of the main
+// key writing as this runner, Daybreak 178), and taken as the head it would
+// keep everything after it from ever going up. Its whole history goes again
+// instead: writing a message twice is harmless.
+export function sendFrom(t: { lastSeq: number }, head: number | undefined): number {
+  return head === undefined || head > t.lastSeq ? 0 : head;
+}
+
 export function appendAll<T>(target: T[], items: readonly T[]): void {
   for (const item of items) target.push(item);
 }
@@ -4010,10 +4020,16 @@ export class ConvexSync {
     if (!filled.size) return [];
     const heads = (await this.post('query', 'sync:messageHeads', { key: this.deps.key, runnerId: this.runnerId })) as { threadId: string; lastSeq: number }[] | null;
     const have = new Map((heads ?? []).map((h) => [h.threadId, h.lastSeq]));
-    for (const [id, seq] of have) if (seq > (this.heads.get(id) ?? 0)) this.heads.set(id, seq);
+    const listed = this.deps.runner.list(ALL);
+    const lastSeqs = new Map(listed.map((t) => [t.id, t.lastSeq]));
+    for (const [id, seq] of have) {
+      // Past its own log (sendFrom): not this runner's, so no head of it.
+      if (seq > (lastSeqs.get(id) ?? Infinity)) continue;
+      if (seq > (this.heads.get(id) ?? 0)) this.heads.set(id, seq);
+    }
     const out: MessageDoc[] = [];
-    for (const t of this.deps.runner.list(ALL)) {
-      if (filled.has(t.id)) appendAll(out, this.messagesAfter(t, have.get(t.id) ?? 0));
+    for (const t of listed) {
+      if (filled.has(t.id)) appendAll(out, this.messagesAfter(t, sendFrom(t, have.get(t.id))));
     }
     return out;
   }
@@ -4024,7 +4040,11 @@ export class ConvexSync {
     const filled = this.filledThreads();
     const out: MessageDoc[] = [];
     for (const t of this.deps.runner.list(ALL)) {
-      if (filled.has(t.id)) appendAll(out, this.messagesAfter(t, this.heads.get(t.id) ?? 0));
+      if (!filled.has(t.id)) continue;
+      const from = sendFrom(t, this.heads.get(t.id));
+      // One noted past its own log goes, so the next start doesn't trust it either.
+      if (from === 0) this.heads.delete(t.id);
+      appendAll(out, this.messagesAfter(t, from));
     }
     return out;
   }

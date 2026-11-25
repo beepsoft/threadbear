@@ -12,7 +12,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { readShareImage } from './share-images.ts';
 import { CallerGate } from './rpc-gate.ts';
-import { threadOfSocket } from './peer.ts';
+import { MARK_NAMES, ownThreadMarks, threadOfSocket } from './peer.ts';
 import { threadKey as makeThreadKey } from './rpc-auth.ts';
 import { makePrivate } from './win-acl.ts';
 import { loadConfig, ensureHome, readToken, paths, recordListening, defaultHome, DEFAULT_CWD, RUNNER_VERSION, RunnerJsonError, peekRunnerJson, expandHome } from './config.ts';
@@ -282,6 +282,15 @@ async function main(): Promise<void> {
   removeTempFiles(cfg.home, paths.run(cfg.home), paths.threads(cfg.home));
 
   const registry = new ProcessRegistry(paths.run(cfg.home), log);
+  // The thread keys and ids this runner was started under (a dev runner's,
+  // from a thread's shell): a connection under any other thread's that isn't
+  // one of this runner's own threads is turned away (Daybreak finding 177).
+  // Read now, while its parents are still there.
+  const own = await ownThreadMarks({ log });
+  // Read: what it starts without a thread's own environment mustn't carry
+  // the starting thread's (a dev runner's tb would otherwise use that
+  // thread's key here, and be refused).
+  for (const n of MARK_NAMES) delete process.env[n];
   // Waits until the old CLIs are gone, so a resume never runs beside them.
   // A copy's run/ lists the live runner's CLIs: forgotten, never stopped.
   if (copyOfReal) registry.removeFile();
@@ -1723,7 +1732,7 @@ async function main(): Promise<void> {
     relay,
     virtualStart: (p) => virtualRunners.start(p),
     gate: new CallerGate({ runner, remote: peers, schedules: scheduler, images: runner.importQuota }),
-    callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id) || peers.owns(id), log }),
+    callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id) || peers.owns(id), log, own, keyOf: (id) => makeThreadKey(token, id) }),
     updates: () => (draining ? undefined : runnerUpdates()),
     appHello: (build, app) => appRestarts.appHello(build, app),
     appSeen: () => appSeen.mark(),
@@ -1995,7 +2004,7 @@ async function main(): Promise<void> {
         // Its port is on disk too (drain-<pid>.json), so a thread's shell can
         // reach this one as well as the primary.
         gate: new CallerGate({ runner, schedules: scheduler, images: runner.importQuota }),
-        callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id), log }),
+        callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id), log, own, keyOf: (id) => makeThreadKey(token, id) }),
         methods: {
           ...scheduledSendMethods(runner),
           'drain.hello': () => {

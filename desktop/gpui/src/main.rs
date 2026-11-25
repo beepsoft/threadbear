@@ -142,6 +142,7 @@ mod slash_palette;
 mod slash_resize;
 mod spinner;
 mod style;
+mod svg_worker;
 mod swift_import;
 mod swipe_nav;
 mod terminal;
@@ -327,7 +328,17 @@ fn initial_bounds(settings: &Settings, cx: &App) -> Bounds<Pixels> {
     }
 }
 
+/// The system allocator, held to a limit in the drawing process only
+/// (svg_worker.rs).
+#[global_allocator]
+static ALLOCATOR: svg_worker::Capped = svg_worker::Capped;
+
 fn main() {
+    // Started again to draw one picture's SVG: does that and exits, before
+    // anything else (svg_worker.rs).
+    svg_worker::serve_if_asked();
+    // Pictures' SVGs are drawn by that process from here on.
+    gpui_kit::set_picture_drawer(svg_worker::draw);
     // A scripted app against the real data folder stops here, and one that
     // goes on gets a pasteboard of its own, before the platform reads it
     // (scripted.rs).

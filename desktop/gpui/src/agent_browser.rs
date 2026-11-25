@@ -981,7 +981,10 @@ impl SidePane {
                 picture
                     .id(SharedString::from(format!("browser-still-{}", tab.id())))
                     .child(
-                        img(ImageSource::Image(still.image))
+                        // Through the picture budget (fit_picture.rs): a new
+                        // still every few seconds, and GPUI's own cache would
+                        // keep every old one's pixels.
+                        img(crate::fit_picture::bytes_source(still.image))
                             .size_full()
                             .object_fit(ObjectFit::Cover),
                     ),

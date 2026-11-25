@@ -33,6 +33,11 @@
 # the image is still built and checked, just not pushed, and the tests
 # don't run, as nothing waits on them.
 #
+# The build installs Debian packages only as runner/box/debs.lock names them,
+# each checked by its SHA-256 before dpkg runs (box/debs.ts), so the same
+# commit builds from the same files whenever it's built; box/lock-debs.sh
+# moves the lock on to a newer snapshot of Debian's archive (Daybreak, 24 Nov).
+#
 # Free, as runner.yml's must be (Mike, 9 Nov): standard hosted runners, no
 # schedule, a newer push cancelling the run before it, and only when the
 # image's files changed (the paths below: what the Dockerfile copies, the
@@ -54,6 +59,8 @@ on:
       - 'runner/.dockerignore'
       - 'runner/box/Dockerfile'
       - 'runner/box/entrypoint.sh'
+      - 'runner/box/debs.lock'
+      - 'runner/box/debs.ts'
       - 'runner/box/smoke.sh'
       - '.github/workflows/box-image.yml'
   workflow_dispatch:
@@ -120,10 +127,15 @@ jobs:
           BUILT_AT: ${{ steps.names.outputs.built_at }}
           SOURCE: ${{ github.server_url }}/${{ github.repository }}
         run: |
+          # The Debian packages' lock, by hash and snapshot, on the image too.
+          debs="sha256:$(sha256sum < runner/box/debs.lock | cut -d' ' -f1)"
+          snapshot=$(sed -n 's/^# snapshot: //p' runner/box/debs.lock)
           docker build --platform linux/amd64 -f runner/box/Dockerfile \
             --build-arg COMMIT="$SHA" --build-arg BUILT_AT="$BUILT_AT" \
             --label org.opencontainers.image.source="$SOURCE" \
             --label org.opencontainers.image.revision="$SHA" \
+            --label dev.threadbear.box.debs-lock="$debs" \
+            --label dev.threadbear.box.debs-snapshot="$snapshot" \
             --label org.opencontainers.image.description="Threadbear virtual runner box: the runner in box mode and Claude Code" \
             -t "$IMAGE:$SHA" runner
           docker image ls "$IMAGE"
@@ -254,7 +266,7 @@ jobs:
           case "$status" in
             identical) ;;
             ahead)
-              newer=$(gh api "repos/$REPO/compare/$SHA...heads/main" --jq '[.files[] | .filename, (.previous_filename // empty)] | (length >= 300), (map(select(test("^(runner/(src|bin)/|runner/(package\\.json|package-lock\\.json|\\.npmrc|\\.dockerignore)$|runner/box/(Dockerfile|entrypoint\\.sh|smoke\\.sh)$|\\.github/workflows/box-image\\.yml$)"))) | length)')
+              newer=$(gh api "repos/$REPO/compare/$SHA...heads/main" --jq '[.files[] | .filename, (.previous_filename // empty)] | (length >= 300), (map(select(test("^(runner/(src|bin)/|runner/(package\\.json|package-lock\\.json|\\.npmrc|\\.dockerignore)$|runner/box/(Dockerfile|entrypoint\\.sh|debs\\.lock|debs\\.ts|smoke\\.sh)$|\\.github/workflows/box-image\\.yml$)"))) | length)')
               if [ "$(sed -n 1p <<<"$newer")" != false ] || [ "$(sed -n 2p <<<"$newer")" != 0 ]; then
                 echo "::notice::main has newer changes to the image since ${SHA:0:8}, so this older image isn't promoted."
                 exit 0

@@ -23,7 +23,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use threadbear_core::inbox::{Project as Membership, ThreadSummary};
 use threadbear_core::projects::{self as rules, Project, TextField, Update};
 
@@ -1286,7 +1285,7 @@ pub(crate) fn project_icon(
         // The letter stands in if the file can't be read (a project on
         // another Mac's disk, or a picture this app can't draw).
         let fallback = letter_tile;
-        return img(PathBuf::from(path))
+        return img(crate::fit_picture::icon_source(&path))
             .size(px(size))
             .flex_none()
             .rounded(px(size * 0.22))

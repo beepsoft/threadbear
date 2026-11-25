@@ -12,6 +12,11 @@ struct ThreadbearApp: App {
     @State private var refusedQuickAsk = false
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        // The old quick ask log kept what was said and spoken: gone on the first launch after.
+        QuickAskLogFile.removeOldLog()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

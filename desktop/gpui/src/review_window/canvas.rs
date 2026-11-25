@@ -1618,6 +1618,8 @@ impl ReviewWindow {
     fn cut_out_mark(&mut self, n: u32, path: String, part: [f64; 4], cx: &mut Context<Self>) {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
+            let turn = cx.update(crate::fit_picture::decode_now_turn);
+            let _turn = turn.await;
             let made = cx
                 .background_executor()
                 .spawn(async move { cut_out(&path, part) })
@@ -1650,22 +1652,39 @@ impl ReviewWindow {
 /// A PNG of part of a picture (fractions of it), at most 480 wide, in the
 /// temporary folder; None when the picture isn't on this Mac or won't read.
 fn cut_out(path: &str, part: [f64; 4]) -> Option<std::path::PathBuf> {
-    let picture = image::open(path).ok()?;
-    let (w, h) = (f64::from(picture.width()), f64::from(picture.height()));
-    let x = (part[0] * w).floor() as u32;
-    let y = (part[1] * h).floor() as u32;
-    let cw = (((part[2] - part[0]) * w).ceil() as u32).max(1);
-    let ch = (((part[3] - part[1]) * h).ceil() as u32).max(1);
-    let piece = picture.crop_imm(x, y, cw, ch);
-    let piece = if piece.width() > 480 {
-        piece.resize(
-            480,
-            480 * piece.height() / piece.width().max(1),
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        piece
-    };
+    // Read under the path guard and decoded within the picture budget's
+    // limits (fit_picture.rs); the part is the same fraction of it shrunk.
+    let piece = (0..3).find_map(|_| {
+        let read = || crate::rows::markdown::checked_picture_bytes(std::path::Path::new(path)).ok();
+        match crate::fit_picture::decode_now(
+            read,
+            |size| cut_plan(size, part),
+            |picture| {
+                let picture = image::DynamicImage::ImageRgba8(picture);
+                let (w, h) = (f64::from(picture.width()), f64::from(picture.height()));
+                let x = (part[0] * w).floor() as u32;
+                let y = (part[1] * h).floor() as u32;
+                let cw = (((part[2] - part[0]) * w).ceil() as u32).max(1);
+                let ch = (((part[3] - part[1]) * h).ceil() as u32).max(1);
+                let piece = picture.crop_imm(x, y, cw, ch);
+                let piece = if piece.width() > 480 {
+                    piece.resize(
+                        480,
+                        480 * piece.height() / piece.width().max(1),
+                        image::imageops::FilterType::Triangle,
+                    )
+                } else {
+                    piece
+                };
+                Some(piece)
+            },
+        ) {
+            Ok(piece) => Some(Some(piece)),
+            Err(crate::fit_picture::Missed::Failed) => Some(None),
+            // No room yet (the picture on screen holds some): a while longer.
+            Err(crate::fit_picture::Missed::Busy) => None,
+        }
+    })??;
     let file = std::env::temp_dir().join(format!(
         "threadbear-mark-{}-{}.png",
         std::process::id(),
@@ -1675,6 +1694,36 @@ fn cut_out(path: &str, part: [f64; 4]) -> Option<std::path::PathBuf> {
     ));
     piece.save(&file).ok()?;
     Some(file)
+}
+
+/// What `cut_out` decodes a `size` picture to: only as big as a 480-wide
+/// piece of `part` needs, rather than all 32 million pixels a picture may
+/// keep, and room for the piece cut and shrunk from it. An 8,192-square
+/// picture on screen, with room asked for two whole copies besides, never
+/// fitted the budget, so its cut-out never came (Daybreak 170, round 4).
+fn cut_plan((w, h): (u32, u32), part: [f64; 4]) -> crate::fit_picture::Plan {
+    // The size is the file's; a photo turned by its EXIF is shown (and cut)
+    // the other way round, so plan for whichever asks more.
+    let (a, b) = (cut_plan_as((w, h), part), cut_plan_as((h, w), part));
+    crate::fit_picture::Plan {
+        shown_pixels: a.shown_pixels.max(b.shown_pixels),
+        made_bytes: a.made_bytes.max(b.made_bytes),
+    }
+}
+
+fn cut_plan_as((w, h): (u32, u32), part: [f64; 4]) -> crate::fit_picture::Plan {
+    let (w, h) = (f64::from(w.max(1)), f64::from(h.max(1)));
+    let across = (part[2] - part[0]).clamp(1. / w, 1.);
+    let down = (part[3] - part[1]).clamp(1. / h, 1.);
+    // Decoded at the scale that makes the piece 480 wide, never bigger.
+    let scale = (480. / (across * w)).min(1.);
+    let (kw, kh) = ((w * scale).ceil(), (h * scale).ceil());
+    let piece = ((across * kw).ceil() + 1.) * ((down * kh).ceil() + 1.);
+    crate::fit_picture::Plan {
+        shown_pixels: (kw * kh) as u64,
+        // The piece, and its shrunk copy, no bigger.
+        made_bytes: (piece * 4. * 2.) as u64 + (1 << 20),
+    }
 }
 
 /// The agent's words without their markdown marks: on the board they're
@@ -1706,8 +1755,8 @@ pub(super) fn canvas_key(path: &str) -> String {
 
 impl ReviewWindow {
     /// A clip's or a page's button on its picture: Play (or Show the page),
-    /// or, while it's playing, Stop just over its top right corner, as the
-    /// player covers the picture.
+    /// or, while it's playing, Stop just over its top right corner (under
+    /// it, with the tools' row in the way), as the player covers the picture.
     fn play_button(
         &self,
         scene: &Scene,
@@ -1752,10 +1801,19 @@ impl ReviewWindow {
                 format!("Close {name}'s page"),
             ),
         };
-        let (right, top) = if playing {
+        // Clear of the tools' row, which is drawn over the board and takes
+        // a click aimed at a button under it: Stop goes under the picture
+        // when there's no room over it (a sound's Stop sat under the row and
+        // never stopped it, 24 Nov 2026).
+        let (right, top) = if !playing {
+            (
+                s.x + s.w - 8.,
+                (s.y + 8.).max(PLAY_TOP.min(s.y + s.h - 34.)),
+            )
+        } else if s.y - 34. >= PLAY_TOP || s.y + s.h + 34. > scene.view.1 {
             (s.x + s.w, s.y - 34.)
         } else {
-            (s.x + s.w - 8., s.y + 8.)
+            (s.x + s.w, s.y + s.h + 8.)
         };
         crate::highlights::tipped(
             h_flex()
@@ -1977,5 +2035,36 @@ impl ReviewWindow {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_plan;
+    use crate::fit_picture::{BUDGET_BYTES, LIMITS};
+
+    // Daybreak 170, round 4: an 8,192-square picture on screen keeps 134 MB,
+    // and its cut-out asked for 896 MB besides, so it never fitted.
+    #[test]
+    fn a_cut_out_asks_only_for_what_its_piece_needs() {
+        let kept_on_screen = LIMITS.shown_pixels * 4;
+        let small = cut_plan((8192, 8192), [0.4, 0.4, 0.45, 0.45]);
+        let whole = cut_plan((8192, 8192), [0., 0., 1., 1.]);
+        for plan in [&small, &whole] {
+            let limits = gpui_kit::image_budget::DecodeLimits {
+                shown_pixels: plan.shown_pixels.min(LIMITS.shown_pixels),
+                frames: 1,
+                ..LIMITS
+            };
+            let need =
+                gpui_kit::image_budget::peak_bytes(50 << 20, Some((8192, 8192)), false, &limits)
+                    + plan.made_bytes;
+            assert!(kept_on_screen + need < BUDGET_BYTES, "{need}");
+        }
+        // The whole picture is decoded only as big as a 480-wide piece.
+        assert!(whole.shown_pixels <= 481 * 481);
+        // A small part keeps its detail: up to the picture's own size.
+        assert!(small.shown_pixels >= 4096 * 4096);
+        assert!(small.made_bytes < 8 << 20);
     }
 }

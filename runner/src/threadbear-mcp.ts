@@ -1468,7 +1468,7 @@ export function buildThreadbearTools(
         icon: z
           .string()
           .optional()
-          .describe('A path to a picture (PNG, SVG, ICNS...), an SF Symbol name such as "film", or "auto" to let the librarian find one again.'),
+          .describe('A path to a picture (PNG, ICNS or .ico), an SF Symbol name such as "film", or "auto" to let the librarian find one again.'),
         notion: z
           .string()
           .optional()

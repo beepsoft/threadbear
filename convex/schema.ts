@@ -782,6 +782,8 @@ export const appSchema = defineSchema({
     runnerId: v.optional(v.string()),
   })
     .index('by_thread_seq', ['threadId', 'seq'])
+    // A runner key's newest row of its own in a thread (sync.ts messageHeads, Daybreak 178).
+    .index('by_thread_runner_seq', ['threadId', 'runnerId', 'seq'])
     .index('by_thread_pagedAt', ['threadId', 'pagedAt'])
     .index('by_pagedAt', ['pagedAt'])
     .index('by_runnerId', ['runnerId'])

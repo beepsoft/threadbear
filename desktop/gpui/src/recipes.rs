@@ -30,7 +30,6 @@ use crate::style::px;
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
 use threadbear_core::chrono::Local;
 use threadbear_core::recipes::{self as rules, Day, Recipe, RecipeDetail, RecipeState};
@@ -1743,7 +1742,7 @@ fn header_fill(recipe: &Recipe, radius: f32) -> AnyElement {
         Some(path) => fill
             .overflow_hidden()
             .child(
-                img(PathBuf::from(path))
+                img(crate::fit_picture::icon_source(path))
                     .size_full()
                     .object_fit(ObjectFit::Cover),
             )

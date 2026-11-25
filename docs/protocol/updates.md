@@ -79,7 +79,38 @@ folder is deleted when the check ends, however it ends, so a tag that
 didn't verify, or a fetch cut short, leaves nothing in the checkout. Every
 git command has a deadline (two minutes, five for one that talks to a
 remote) and is stopped with whatever it started, and the check fails and
-says so. A runner from before 7 Nov 2026 fetched every tag into
+says so. Every git command it runs, and Mike's runner's publishing below,
+is release git (`upstream.ts`, Daybreak 179 and 180, 24 Nov 2026), as the
+checkout's `.git` may have come with an archive or a shared drive, or be
+the one a thread's worktree shares: none of the runner's `GIT_` variables
+but who commits; no system or global config for a fork's check (Mike's
+publishing keeps his, for his signing setup and the push to GitHub); every
+setting in the checkout's own config that would run something switched off
+on the command line just before each command (`safe-git.ts`
+`repoProofConfig`: hooks, fsmonitor, filters, diff drivers, credential
+helpers, ssh and askpass programs, protocols it allows; and signing
+programs, `log.showSignature`, push signing and submodules; the ssh
+command, signing programs and credential helpers are set to the owner's
+own or git's defaults every time, whatever the checkout's config says, and
+a setting whose name isn't UTF-8, which `-c` can't name, stops git); only `https`
+and `ssh` to a remote, with git's own upload-pack and receive-pack named;
+and the remote given as a URL rebuilt from `remote.<name>.url` as
+configured, an https or ssh address of a plain host and path (anything
+else, a folder, `file://`, `ext::`, or more than one address, and upstream
+counts as off; a user and password in it are left out). A checkout whose
+own config rewrites an address (`url.*.insteadOf`, `pushInsteadOf`),
+configures a remote named by a URL (which git looks a URL up as), or sets
+anything under `http.` (a proxy, certificate checks) isn't used
+for network git at all: the check fails, and Mike's runner holds its
+release, saying which setting. Replacement objects, grafts and the
+commit-graph are off (`GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE=/dev/null`,
+`core.commitGraph=false`), and a checkout with a `refs/replace/` ref or an
+`info/grafts` file isn't checked at all: the check fails and says so, and
+Mike's runner holds its release with the reason. A release's
+`scripts/release-signers` and `scripts/release-keys-revoked` are read
+object by object from the signed commit (commit, trees, blob), each one's
+bytes hashed and checked against its id, so a forged object fails the
+check rather than counting, and so does one it names that can't be read. A runner from before 7 Nov 2026 fetched every tag into
 `refs/threadbear/upstream-incoming/*`, unchecked; each check deletes
 anything left there. Verified
 means: the tag object is `object`, `type commit`, `tag <the name it came

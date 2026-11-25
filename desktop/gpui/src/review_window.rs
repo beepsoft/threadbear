@@ -2059,7 +2059,7 @@ impl ReviewWindow {
             "chips": self.reply.read(cx).tokens().len(),
             // The picture viewer over the window: "" when it's closed, else
             // "<n> of <total> <file>", with " (loading)" until it's drawn.
-            "viewer": self.viewer.describe(),
+            "viewer": self.viewer.describe(cx),
             "none": draft.none,
             "shot": s.shot(),
             "peeking": s.peeking,

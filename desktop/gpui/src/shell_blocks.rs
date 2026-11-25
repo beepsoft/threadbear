@@ -1,5 +1,5 @@
 // The header bar on a reply's code blocks: the language, and copy, with play
-// before it on a ```bash block (ShellBlockIcons.swift): play puts the command
+// before it on a ```bash block or an untagged one-liner (ShellBlockIcons.swift): play puts the command
 // in the thread's Terminal, at its prompt and never run, and copy copies it.
 // Play only shows where the Terminal would be the thread's own shell, in its
 // own folder on this Mac (terminal.rs `can_put`). gpui-kit draws the bar in
